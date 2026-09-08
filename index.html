@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+  <main>
+      <section id="searchScreen" class="screen" aria-labelledby="searchScreenTitle">
+        <div class="screen-heading">
+          <h2 id="searchScreenTitle">대학·학과 검색</h2>
+          <p>대학을 선택한 뒤 학과·모집단위를 검색하세요.</p>
+        </div>
+
+      <section class="block">
+        <h2>1. 대학 검색</h2>
+        <form id="universityForm" class="row">
+          <input id="universityQuery" type="search" placeholder="대학명 두 글자 이상 (예: 한양)" autocomplete="off" />
+          <button type="submit" id="universitySearchButton">검색</button>
+        </form>
+        <ul id="universityResults" class="list" role="listbox" hidden></ul>
+        <p id="status" class="status" role="status" aria-live="polite">대학명을 검색하세요.</p>
+      </section>
+
+      <section class="block">
+        <h2>2. 학과·모집단위 검색</h2>
+        <p id="currentUniversity" class="muted">선택된 대학이 없습니다.</p>
+        <div class="row">
+          <input id="departmentQuery" type="search" aria-label="학과·모집단위 검색" placeholder="학과·모집단위 검색 (모든 전형)" autocomplete="off" disabled />
+        </div>
+        <ul id="departmentResults" class="list" role="listbox" hidden></ul>
+        <p id="selectionInfo" class="muted"></p>
+        <button id="addButton" type="button" disabled>관심 목록에 추가</button>
+      </section>
+    </section>
+
+    <section id="watchScreen" class="screen" hidden aria-labelledby="watchScreenTitle">
+      <section class="block watch-block">
+        <div class="row spread">
+          <h2 id="watchScreenTitle">관심 목록 (<span id="watchCount">0</span>)</h2>
+          <div class="watch-actions">
+            <button id="refreshButton" type="button" disabled>전체 새로고침</button>
+            <button id="clearButton" type="button" disabled>전체 삭제</button>
+          </div>
+        </div>
+        <p id="refreshStatus" class="status" role="status" aria-live="polite"></p>
+        <div class="table-wrap">
+          <table id="watchTable">
+            <thead>
+              <tr><th>대학</th><th>전형</th><th>모집단위</th><th class="num">모집</th><th class="num">지원</th><th class="num">경쟁률</th><th>갱신 시각</th><th></th></tr>
+            </thead>
+            <tbody id="watchBody"></tbody>
+          </table>
+        </div>
+        <p id="watchEmpty" class="muted">아직 추가한 항목이 없습니다.</p>
+      </section>
+    </section>
+  </main>
+
+  <nav class="bottom-nav" aria-label="주요 화면">
+    <div class="bottom-nav-inner">
+      <button type="button" class="nav-item active" data-nav-target="search" aria-controls="searchScreen" aria-current="page">
+        <span class="nav-icon" aria-hidden="true">⌕</span>
+        <span>검색</span>
+      </button>
+      <button type="button" class="nav-item" data-nav-target="watch" aria-controls="watchScreen">
+        <span class="nav-icon" aria-hidden="true">♡</span>
+        <span>관심 목록 <span id="navWatchCount" class="nav-count">0</span></span>
+      </button>
+    </div>
+  </nav>
+
+  <script src="app.js"></script>
+</body>
+</html>
