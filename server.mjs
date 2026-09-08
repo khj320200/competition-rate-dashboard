@@ -3,11 +3,13 @@ import { readFile, stat } from 'node:fs/promises';
 import { extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import iconv from 'iconv-lite';
+import { createScraperTransport, validateSourceUrl, checkUpstreamStatus, checkHtmlResponse, ScraperError } from './scraper-fetch.mjs';
 
 const ROOT = resolve(fileURLToPath(new URL('.', import.meta.url)));
 const PORT = Number(process.env.PORT || 3000);
 const CACHE_TTL_MS = 60_000;
 const cache = new Map();
+const scraper = createScraperTransport();
 
 const UNIVERSITY_CATALOG = [
   {
@@ -132,6 +134,7 @@ function normalizeCompetitionUrl(rawUrl) {
       }
     }
     parsed.protocol = 'https:';
+    validateSourceUrl(parsed);
     return parsed.href;
   } catch {
     return null;
@@ -588,9 +591,7 @@ function loadEnvCookie() {
     'uway.com',
     'info.uway.com',
     'uwayapply.com',
-    'ratio.uwayapply.com',
-    'jinhakapply.com',
-    'addon.jinhakapply.com'
+    'ratio.uwayapply.com'
   ];
   for (const domain of targetDomains) {
     if (!cookieJar.has(domain)) cookieJar.set(domain, new Map());
@@ -621,6 +622,8 @@ function storeCookies(hostname, setCookieHeaders) {
         targetDomain = dVal.replace(/^\./, '');
       }
     }
+    if (hostname !== targetDomain && !hostname.endsWith(`.${targetDomain}`)) continue;
+    if (!['uway.com', 'info.uway.com', 'uwayapply.com', 'ratio.uwayapply.com', 'jinhakapply.com', 'addon.jinhakapply.com'].includes(targetDomain)) continue;
     if (!cookieJar.has(targetDomain)) {
       cookieJar.set(targetDomain, new Map());
     }
@@ -632,7 +635,9 @@ function getCookiesForHost(hostname) {
   const host = hostname.toLowerCase();
   const result = new Map();
 
-  const envCookie = process.env.UWAY_COOKIE || process.env.COOKIE || '';
+  const envCookie = host === 'addon.jinhakapply.com'
+    ? process.env.JINHAK_COOKIE || ''
+    : process.env.UWAY_COOKIE || process.env.COOKIE || '';
   if (envCookie) {
     for (const [k, v] of parseCookieString(envCookie)) {
       result.set(k, v);
@@ -657,7 +662,6 @@ async function ensureSession(targetUrl) {
     const parsed = new URL(targetUrl);
     const host = parsed.hostname.toLowerCase();
     if (warmedHosts.has(host)) return;
-    warmedHosts.add(host);
 
     const originUrl = `${parsed.protocol}//${parsed.hostname}/`;
     const headers = {
@@ -676,7 +680,7 @@ async function ensureSession(targetUrl) {
     const cookieHeader = getCookiesForHost(host);
     if (cookieHeader) headers.Cookie = cookieHeader;
 
-    const response = await fetch(originUrl, {
+    const response = await scraper.fetch(originUrl, {
       redirect: 'manual',
       headers,
       signal: AbortSignal.timeout(8_000)
@@ -685,16 +689,17 @@ async function ensureSession(targetUrl) {
     if (setCookies) {
       storeCookies(host, setCookies);
     }
+    await response.body?.cancel();
+    if (response.ok || (response.status >= 300 && response.status < 400)) warmedHosts.add(host);
   } catch {}
 }
 
 async function fetchHtml(url, encoding, allowedHosts = new Set([...ALLOWED_COMPETITION_HOSTS, ...ALLOWED_SEARCH_HOSTS])) {
-  let currentUrl = url;
+  let currentUrl = validateSourceUrl(url, allowedHosts).href;
   await ensureSession(currentUrl);
 
   for (let hop = 0; hop <= 3; hop += 1) {
-    const current = new URL(currentUrl);
-    if (!allowedHosts.has(current.hostname.toLowerCase())) throw new Error('허용되지 않은 원문 호스트입니다.');
+    const current = validateSourceUrl(currentUrl, allowedHosts);
 
     const headers = {
       Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -716,7 +721,7 @@ async function fetchHtml(url, encoding, allowedHosts = new Set([...ALLOWED_COMPE
       headers.Cookie = cookieHeader;
     }
 
-    const response = await fetch(current, {
+    const response = await scraper.fetch(current, {
       redirect: 'manual',
       headers,
       signal: AbortSignal.timeout(15_000)
@@ -729,17 +734,24 @@ async function fetchHtml(url, encoding, allowedHosts = new Set([...ALLOWED_COMPE
 
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get('location');
+      await response.body?.cancel();
       if (!location || hop === 3) throw new Error('원문 리다이렉트가 너무 많습니다.');
       currentUrl = new URL(location, current).href;
       continue;
     }
-    if (!response.ok) throw new Error(`원문 응답 오류 (${response.status})`);
-    const buffer = Buffer.from(await response.arrayBuffer());
-    try {
-      return new TextDecoder(encoding).decode(buffer);
-    } catch {
-      return new TextDecoder('utf-8').decode(buffer);
+    if (!response.ok) {
+      await response.body?.cancel();
+      checkUpstreamStatus(response, current, scraper.usesProxy(current.hostname));
     }
+    const buffer = Buffer.from(await response.arrayBuffer());
+    let html;
+    try {
+      html = new TextDecoder(encoding).decode(buffer);
+    } catch {
+      html = new TextDecoder('utf-8').decode(buffer);
+    }
+    checkHtmlResponse(html);
+    return html;
   }
   throw new Error('원문을 읽지 못했습니다.');
 }
@@ -749,6 +761,9 @@ async function searchUwayUniversities(query) {
   if (trimmed.length < 2) throw new Error('대학명은 두 글자 이상 입력하세요.');
   const searchUrl = `https://info.uway.com/power/?v_mode=school_nm_view&R_SearchText=${encodeEucKrQuery(trimmed)}`;
   const html = await fetchHtml(searchUrl, 'euc-kr', ALLOWED_SEARCH_HOSTS);
+  if (!/<table\b/i.test(html) || !/학교명|대학명|경쟁률|검색결과|검색\s*결과/.test(html)) {
+    throw new ScraperError('UPSTREAM_FORMAT_CHANGED', '대학 검색 원문의 형식을 확인할 수 없습니다. 접근 제한 또는 원문 변경 여부를 확인하세요.');
+  }
   return parseUwaySearchResults(html);
 }
 
@@ -783,6 +798,10 @@ function sendJson(response, status, payload) {
 }
 
 async function handleApi(url, response) {
+  if (url.pathname === '/api/health') {
+    sendJson(response, 200, { status: 'ok', scraper: scraper.status });
+    return true;
+  }
   if (url.pathname === '/api/universities' || url.pathname === '/api/universities/search') {
     const query = (url.searchParams.get('q') || '').trim();
     if (!query) {
@@ -793,7 +812,7 @@ async function handleApi(url, response) {
       const results = await searchUwayUniversities(query);
       sendJson(response, 200, results);
     } catch (error) {
-      sendJson(response, 400, { error: error.message || '대학 검색에 실패했습니다.' });
+      sendJson(response, query.length < 2 ? 400 : 502, { error: error.message || '대학 검색에 실패했습니다.', code: error.code || 'SEARCH_FAILED' });
     }
     return true;
   }
@@ -836,13 +855,18 @@ async function handleApi(url, response) {
       });
       return true;
     }
-    sendJson(response, 502, { error: error.message || '공개 원문을 읽지 못했습니다.' });
+    sendJson(response, 502, { error: error.message || '공개 원문을 읽지 못했습니다.', code: error.code || 'FETCH_FAILED' });
   }
   return true;
 }
 
 async function serveStatic(pathname, response) {
   const relativePath = pathname === '/' ? 'index.html' : decodeURIComponent(pathname.replace(/^\/+/, ''));
+  if (!new Set(['index.html', 'app.js', 'styles.css']).has(relativePath)) {
+    response.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+    response.end('Not Found');
+    return;
+  }
   const filePath = resolve(ROOT, relativePath);
   if (filePath !== ROOT && !filePath.startsWith(`${ROOT}${sep}`)) {
     response.writeHead(403);
@@ -865,7 +889,7 @@ async function serveStatic(pathname, response) {
   }
 }
 
-const server = createServer(async (request, response) => {
+export const server = createServer(async (request, response) => {
   const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
   if (request.method !== 'GET' && request.method !== 'HEAD') {
     response.writeHead(405, { Allow: 'GET, HEAD' });
@@ -890,6 +914,9 @@ const server = createServer(async (request, response) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`RATIO dashboard running at http://localhost:${PORT}`);
-});
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  server.listen(PORT, () => {
+    console.log(`RATIO dashboard running at http://localhost:${PORT}`);
+    console.log(`Scraper proxy configured: ${scraper.status.proxyConfigured}; hosts: ${scraper.status.proxyHosts.join(',') || 'direct'}`);
+  });
+}

@@ -5,14 +5,17 @@
   "description": "uway 공개 경쟁률 페이지를 검색형 대시보드로 보여주는 Node 웹앱",
   "type": "module",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22.0.0"
   },
   "scripts": {
     "start": "node server.mjs",
     "dev": "node --watch server.mjs",
-    "check": "node --check server.mjs && node --check app.js"
+    "check": "node --check server.mjs && node --check scraper-fetch.mjs && node --check app.js",
+    "test": "node --test",
+    "diagnose": "node scripts/check-sources.mjs"
   },
   "dependencies": {
-    "iconv-lite": "0.6.3"
+    "iconv-lite": "0.6.3",
+    "undici": "7.29.1"
   }
 }

@@ -31,6 +31,11 @@ function setStatus(message, isError) {
   dom.status.classList.toggle('error', Boolean(isError));
 }
 
+function staleWarning(data) {
+  if (!data?.stale && data?.live !== false) return '';
+  return data.warning || '최신 경쟁률을 불러오지 못해 이전에 수집한 데이터를 표시합니다.';
+}
+
 async function fetchJson(url) {
   const response = await fetch(url, { headers: { Accept: 'application/json' } });
   let payload = null;
@@ -147,7 +152,10 @@ async function selectUniversity(uni) {
     dom.departmentResults.hidden = true;
     dom.selectionInfo.textContent = '';
     updateAddButton();
-    setStatus(`${uni.name} 연동 완료${data.updatedAt ? ` · ${data.updatedAt}` : ''}.`);
+    const warning = staleWarning(data);
+    setStatus(warning
+      ? `${uni.name}: ${warning}${data.updatedAt ? ` · 원문 갱신: ${data.updatedAt}` : ''}`
+      : `${uni.name} 연동 완료${data.updatedAt ? ` · ${data.updatedAt}` : ''}.`, Boolean(warning));
   } catch (error) {
     state.data = null;
     state.admissionId = '';
@@ -241,6 +249,7 @@ function addCurrent() {
   const key = watchKey(row, type);
   if (state.watchlist.some((item) => item.key === key)) return;
   const source = state.data.source || {};
+  const warning = staleWarning(state.data);
   state.watchlist.unshift({
     key,
     university: state.data.university || state.university?.name || '',
@@ -256,12 +265,13 @@ function addCurrent() {
     providerUpdatedAt: state.data.updatedAt || '',
     providerUpdateInterval: source.updateInterval || '',
     providerNote: state.data.note || '',
-    refreshedAt: new Date().toISOString(),
-    refreshError: ''
+    refreshedAt: state.data.fetchedAt || (warning ? '' : new Date().toISOString()),
+    refreshError: warning
   });
   saveWatchlist();
   renderWatchlist();
   updateAddButton();
+  if (warning) setStatus(`이전에 수집한 데이터를 관심 목록에 추가했습니다. ${warning}`, true);
 }
 
 function removeWatch(key) {
@@ -355,6 +365,10 @@ function renderWatchlist() {
     const providerUpdated = document.createElement('td');
     providerUpdated.className = 'provider-updated-at';
     providerUpdated.textContent = formatProviderUpdatedAt(item.providerUpdatedAt);
+    if (item.refreshError) {
+      providerUpdated.classList.add('refresh-error');
+      providerUpdated.textContent = `${providerUpdated.textContent || '-'} · 갱신 실패: ${item.refreshError}`;
+    }
     const remove = document.createElement('td');
     remove.className = 'remove';
     const button = document.createElement('button');
@@ -423,6 +437,11 @@ async function refreshWatchlist() {
         failed += 1;
         return { ...item, refreshError: result?.error || '경쟁률을 불러오지 못했습니다.' };
       }
+      const warning = staleWarning(result.data);
+      if (warning) {
+        failed += 1;
+        return { ...item, refreshError: warning };
+      }
       const match = findWatchRow(result.data, item);
       if (!match) {
         failed += 1;
@@ -447,7 +466,7 @@ async function refreshWatchlist() {
         providerUpdatedAt: result.data.updatedAt || item.providerUpdatedAt || '',
         providerUpdateInterval: source.updateInterval || item.providerUpdateInterval || '',
         providerNote: result.data.note || item.providerNote || '',
-        refreshedAt: new Date().toISOString(),
+        refreshedAt: result.data.fetchedAt || new Date().toISOString(),
         refreshError: ''
       };
     });
