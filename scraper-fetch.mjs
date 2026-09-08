@@ -23,8 +23,8 @@ export function validateSourceUrl(value, allowedHosts = SOURCE_HOSTS) {
 }
 
 export function createScraperTransport({
-  proxyUrl = process.env.SCRAPER_PROXY_URL || '',
-  proxyHosts = process.env.SCRAPER_PROXY_HOSTS || 'addon.jinhakapply.com',
+  proxyUrl = process.env.HTTP_PROXY || process.env.HTTPS_PROXY || process.env.SCRAPER_PROXY_URL || '',
+  proxyHosts = process.env.SCRAPER_PROXY_HOSTS || (process.env.HTTP_PROXY || process.env.HTTPS_PROXY ? [...SOURCE_HOSTS].join(',') : 'addon.jinhakapply.com'),
   fetchImpl = fetch,
   createDispatcher = (options) => new ProxyAgent(options)
 } = {}) {
@@ -36,14 +36,13 @@ export function createScraperTransport({
   if (proxyUrl.trim()) {
     try {
       const proxy = new URL(proxyUrl.trim());
-      if (!['http:', 'https:'].includes(proxy.protocol) || proxy.pathname !== '/' || proxy.search || proxy.hash) throw new Error();
+      if (!['http:', 'https:'].includes(proxy.protocol) || (proxy.pathname !== '/' && proxy.pathname !== '') || proxy.search || proxy.hash) throw new Error();
       const token = proxy.username || proxy.password
         ? `Basic ${Buffer.from(`${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`).toString('base64')}`
         : undefined;
       dispatcher = createDispatcher({ uri: proxy.origin, ...(token ? { token } : {}) });
     } catch {
-      // Never include the proxy URL or the original exception: they can contain credentials.
-      throw new ScraperError('PROXY_CONFIG', 'SCRAPER_PROXY_URL을 확인하세요. HTTP/HTTPS 프록시 주소가 필요합니다.');
+      throw new ScraperError('PROXY_CONFIG', '프록시 주소를 확인하세요. HTTP/HTTPS 프록시 주소(예: http://ip:port)가 필요합니다.');
     }
   }
 
@@ -88,7 +87,6 @@ export function checkUpstreamStatus(response, url, proxied) {
 }
 
 export function checkHtmlResponse(html) {
-  // Match visible page text, not a captcha library/script on an otherwise valid page.
   const text = html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '').replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
   if (/access\s+denied|request\s+(?:was\s+)?blocked|해외\s*(?:IP|아이피|접속)[\s\S]{0,60}(?:차단|제한)|접근(?:이|을|\s)*차단|접근이\s*거부|비정상적인\s*접근|verify\s+you\s+are\s+human/i.test(text)) {
     throw new ScraperError('UPSTREAM_BLOCK_PAGE', '원문 서버가 데이터 대신 접근 차단 안내를 반환했습니다. 원문 접속 경로를 확인하세요.');
