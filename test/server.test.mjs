@@ -18,7 +18,7 @@ before(async () => {
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   origin = `http://127.0.0.1:${server.address().port}`;
-  for (const host of ['https://addon.jinhakapply.com', 'https://info.uway.com']) {
+  for (const host of ['https://addon.jinhakapply.com', 'https://info.uway.com', 'https://apply.jinhakapply.com']) {
     mock.get(host).intercept({ path: '/' }).reply(200, '<html></html>').persist();
   }
 });
@@ -58,6 +58,8 @@ test('live parse succeeds; later 403 returns original cached data explicitly sta
   assert.equal(fresh.status, 200);
   assert.equal(fresh.json.live, true);
   assert.equal(fresh.json.admissionTypes[0].rows[0].ratio, 3);
+  assert.equal(fresh.json.guideUrl, 'https://apply.jinhakapply.com/Notice/1003038/A');
+  assert.equal(fresh.json.source.guideUrl, 'https://apply.jinhakapply.com/Notice/1003038/A');
   mock.get('https://addon.jinhakapply.com').intercept({ path }).reply(403, 'Forbidden');
   const stale = await request('/api/competition?university=catholic&refresh=1');
   assert.equal(stale.status, 200);
@@ -98,4 +100,36 @@ test('unsafe URL or redirect is rejected before reaching another host', async ()
   const redirected = await request('/api/competition?url=https%3A%2F%2Faddon.jinhakapply.com%2Fredirect.html');
   assert.equal(redirected.status, 502);
   assert.equal(redirected.json.code, 'INVALID_SOURCE');
+});
+
+test('historical competition API fetches and parses past data', async () => {
+  const pastPath = '/SmartRatio/PastRatioUniv?univid=1003&year=2025&category=1';
+  mock.get('https://apply.jinhakapply.com').intercept({ path: pastPath }).reply(200,
+    '<input type="hidden" id="hdnResult" value="{&quot;Columns&quot;:[&quot;CategoryName&quot;,&quot;MajorName&quot;,&quot;SelTypeName&quot;,&quot;Mojip&quot;,&quot;Jiwon&quot;,&quot;Ratio&quot;],&quot;Rows&quot;:[[&quot;수시&quot;,&quot;컴퓨터정보공학부&quot;,&quot;학생부종합&quot;,20,100,5.0]]}" />');
+
+  const res = await request('/api/competition/history?university=catholic&year=2025&category=1');
+  assert.equal(res.status, 200);
+  assert.equal(res.json.year, '2025');
+  assert.equal(res.json.admissionTypes[0].name, '학생부종합');
+  assert.equal(res.json.admissionTypes[0].rows[0].name, '컴퓨터정보공학부');
+  assert.equal(res.json.admissionTypes[0].rows[0].ratio, 5);
+
+  const invalidYear = await request('/api/competition/history?university=catholic&year=invalid');
+  assert.equal(invalidYear.status, 400);
+
+  // Uway past competition test
+  const uwayPath = '/power/?v_mode=last_ratio_view&o_year=2025&R_SearchText=%BC%AD%BF%EF%BD%C3%B8%B3%B4%EB%C7%D0%B1%B3';
+  mock.get('https://info.uway.com').intercept({ path: uwayPath }).reply(200, iconv.encode(
+    '<table><tr><th>학년도</th><th>모집시기</th><th>지역</th><th>학교</th><th>전형</th><th>학과</th><th>모집인원</th><th>지원인원</th><th>경쟁률</th></tr><tr><td>2025</td><td>수시</td><td>서울</td><td>서울시립대</td><td>논술전형</td><td>컴퓨터과학부</td><td>10</td><td>250</td><td>25.00 : 1</td></tr></table>', 'euc-kr'));
+
+  const uwayRes = await request('/api/competition/history?university=uos&year=2025');
+  assert.equal(uwayRes.status, 200);
+  assert.equal(uwayRes.json.year, '2025');
+  assert.equal(uwayRes.json.admissionTypes[0].name, '논술전형');
+  assert.equal(uwayRes.json.admissionTypes[0].rows[0].name, '컴퓨터과학부');
+  assert.equal(uwayRes.json.admissionTypes[0].rows[0].ratio, 25);
+
+  const unknown = await request('/api/competition/history?university=unknown&year=2025');
+  assert.equal(unknown.status, 400);
+  assert.equal(unknown.json.code, 'INVALID_UNIVERSITY');
 });

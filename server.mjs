@@ -10,6 +10,8 @@ const PORT = Number(process.env.PORT || 3000);
 const CACHE_TTL_MS = 60_000;
 const cache = new Map();
 const scraper = createScraperTransport();
+const HISTORY_CACHE_TTL_MS = 24 * 60 * 60_000;
+const historyCache = new Map();
 
 const UNIVERSITY_CATALOG = [
   {
@@ -18,9 +20,11 @@ const UNIVERSITY_CATALOG = [
     category: '4년제 · 수시',
     provider: '진학어플라이',
     url: 'https://addon.jinhakapply.com/RatioV1/RatioH/Ratio10030381.html',
+    guideUrl: 'https://apply.jinhakapply.com/Notice/1003038/A',
     updateInterval: '1시간 단위',
     parser: 'jinhak',
-    encoding: 'utf-8'
+    encoding: 'utf-8',
+    pastRatioId: '1003'
   },
   {
     id: 'far-east',
@@ -28,6 +32,7 @@ const UNIVERSITY_CATALOG = [
     category: '4년제 · 수시',
     provider: '유웨이',
     url: 'https://ratio.uwayapply.com/Sl5KOlY5SmYlJjomSjdmVGY=',
+    guideUrl: 'http://ipsi3.uwayapply.com/2027/susi2/kdu/?CHA=1',
     updateInterval: '10분 단위',
     parser: 'uway',
     encoding: 'euc-kr'
@@ -38,6 +43,7 @@ const UNIVERSITY_CATALOG = [
     category: '4년제 · 수시',
     provider: '유웨이',
     url: 'https://ratio.uwayapply.com/Sl5KV2FOclc4OUpmJSY6Jko3ZlRm',
+    guideUrl: 'http://ipsi2.uwayapply.com/2027/susi2/kangwon/?CHA=1',
     updateInterval: '매일 5분 단위',
     parser: 'uway',
     encoding: 'euc-kr'
@@ -48,6 +54,7 @@ const UNIVERSITY_CATALOG = [
     category: '4년제 · 수시',
     provider: '유웨이',
     url: 'https://ratio.uwayapply.com/Sl5KJmE6SmYlJjomSjdmVGY=',
+    guideUrl: 'http://ipsi3.uwayapply.com/2027/susi2/uos/?CHA=1',
     updateInterval: '매일 10·13·17시',
     parser: 'uway',
     encoding: 'euc-kr'
@@ -109,6 +116,7 @@ const ALLOWED_COMPETITION_HOSTS = new Set([
 ]);
 
 const ALLOWED_SEARCH_HOSTS = new Set(['info.uway.com']);
+const ALLOWED_HISTORY_HOSTS = new Set(['apply.jinhakapply.com']);
 
 const REGION_LABELS = new Set([
   '서울', '경기', '인천', '강원', '대전', '세종', '충남', '충북',
@@ -155,8 +163,16 @@ function entryFromCompetitionUrl(rawUrl, metadata = {}) {
     url,
     updateInterval: metadata.updateInterval || '원문 안내 기준',
     parser: isJinhak ? 'jinhak' : 'uway',
-    encoding: isJinhak ? 'utf-8' : 'euc-kr'
+    encoding: isJinhak ? 'utf-8' : 'euc-kr',
+    guideUrl: metadata.guideUrl || null
   };
+}
+
+function extractPastRatioId(entry) {
+  if (entry.pastRatioId) return String(entry.pastRatioId);
+  if (entry.provider !== '진학어플라이' && entry.parser !== 'jinhak') return null;
+  const match = String(entry.url || '').match(/(?:Ratio|Notice\/?)(\d{4})/i);
+  return match ? match[1] : null;
 }
 
 function attributeValue(attributes, name) {
@@ -200,6 +216,10 @@ function parseUwaySearchResults(html) {
     const ownership = abbrs.find((value) => /사립|국[·ㆍ.]?공립|공립/.test(value)) || '';
     const status = abbrs.find((value) => /접수|예정|마감|오늘/.test(value)) || '';
     const period = dateIndex >= 0 ? abbrs[dateIndex] : '';
+    const nameLinkMatch = body.match(/<a\b[^>]*href=["']([^"']+)["'][^>]*class=["']link["'][^>]*>([\s\S]*?)<\/a>/i);
+    let guideUrl = nameLinkMatch ? nameLinkMatch[1].trim() : null;
+    if (guideUrl && guideUrl.startsWith('//')) guideUrl = `https:${guideUrl}`;
+
     const key = `${name}|${sourceUrl}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -214,6 +234,7 @@ function parseUwaySearchResults(html) {
       ownership,
       status,
       period,
+      guideUrl,
       supported: true
     });
   }
@@ -398,6 +419,39 @@ function extractNotice(html) {
   return match ? cleanText(match[0]) : '';
 }
 
+function extractJinhakGuideUrl(html, entry) {
+  const noticeMatch = html.match(/<a\b[^>]*href=["']([^"']*(?:apply\.jinhakapply\.com\/Notice\/|\/Notice\/\d+)[^"']*)["']/i)
+    || html.match(/<a\b[^>]*href=["']([^"']+)["'][^>]*>(?:원서접수|모집요강)/i);
+  if (noticeMatch) {
+    let url = noticeMatch[1].trim();
+    if (url.startsWith('//')) url = `https:${url}`;
+    else if (url.startsWith('/')) url = `https://apply.jinhakapply.com${url}`;
+    return url;
+  }
+  const idMatch = String(entry?.url || '').match(/Ratio(\d{7})\d?\.html/i);
+  if (idMatch) {
+    return `https://apply.jinhakapply.com/Notice/${idMatch[1]}/A`;
+  }
+  return null;
+}
+
+function extractUwayGuideUrl(html) {
+  const idMatch = html.match(/<a\b[^>]*href=['"]([^'"]+)['"][^>]*id=['"]id_gouway['"]/i)
+    || html.match(/<a\b[^>]*id=['"]id_gouway['"][^>]*href=['"]([^'"]+)['"]/i);
+  if (idMatch) {
+    let url = idMatch[1].trim();
+    if (url.startsWith('//')) url = `https:${url}`;
+    return url;
+  }
+  const textMatch = html.match(/<a\b[^>]*href=['"]([^'"]+)['"][^>]*>(?:<b>)?(?:원서접수|모집요강)/i);
+  if (textMatch) {
+    let url = textMatch[1].trim();
+    if (url.startsWith('//')) url = `https:${url}`;
+    return url;
+  }
+  return null;
+}
+
 function parseJinhak(html, entry) {
   const updateMatch = html.match(/id=["']RatioTime["'][^>]*>([\s\S]*?)<\//i);
   const yearMatch = html.match(/(20\d{2})\s*학년도/);
@@ -474,6 +528,7 @@ function parseJinhak(html, entry) {
     year: yearMatch?.[1] || '',
     updatedAt: cleanText(updateMatch?.[1] || ''),
     note: extractNotice(html),
+    guideUrl: extractJinhakGuideUrl(html, entry),
     admissionTypes
   };
 }
@@ -540,6 +595,7 @@ function parseUway(html, entry) {
     year: yearMatch?.[1] || '',
     updatedAt: cleanText(updatedMatch?.[1] || ''),
     note: extractNotice(html),
+    guideUrl: extractUwayGuideUrl(html),
     admissionTypes
   };
 }
@@ -771,22 +827,175 @@ async function readCompetition(entry) {
   const html = await fetchHtml(entry.url, entry.encoding, new Set([new URL(entry.url).hostname]));
   const parsed = entry.parser === 'jinhak' ? parseJinhak(html, entry) : parseUway(html, entry);
   if (!parsed.admissionTypes.length) throw new Error(`${entry.name}의 전형 표를 찾지 못했습니다.`);
+  const guideUrl = parsed.guideUrl || entry.guideUrl || null;
   return {
     id: entry.id,
     university: entry.name,
     year: parsed.year,
     updatedAt: parsed.updatedAt,
     note: parsed.note || `${entry.provider} 공개 페이지 기준 경쟁률입니다.`,
+    guideUrl,
     admissionTypes: parsed.admissionTypes,
     source: {
       url: entry.url,
       provider: entry.provider,
       updateInterval: entry.updateInterval,
+      guideUrl,
       portalUrl: 'https://info.uway.com/power/'
     },
     fetchedAt: new Date().toISOString(),
     live: true
   };
+}
+
+function parsePastRatio(html, year) {
+  const hdnMatch = html.match(/id=["']hdnResult["'][^>]*value=["']([^"']+)["']/i);
+  if (hdnMatch) {
+    try {
+      const raw = decodeEntities(hdnMatch[1]);
+      const json = JSON.parse(raw);
+      const cols = json.Columns || [];
+      const majorIdx = cols.indexOf('MajorName');
+      const selTypeIdx = cols.indexOf('SelTypeName');
+      const mojipIdx = cols.indexOf('Mojip');
+      const jiwonIdx = cols.indexOf('Jiwon');
+      const ratioIdx = cols.indexOf('Ratio');
+
+      const typeMap = new Map();
+      (json.Rows || []).forEach((row, i) => {
+        const typeName = selTypeIdx >= 0 ? String(row[selTypeIdx] || '일반전형') : '일반전형';
+        if (!typeMap.has(typeName)) typeMap.set(typeName, []);
+        const name = majorIdx >= 0 ? String(row[majorIdx] || '') : '';
+        const seats = mojipIdx >= 0 ? Number(row[mojipIdx]) || 0 : 0;
+        const applicants = jiwonIdx >= 0 ? Number(row[jiwonIdx]) || 0 : 0;
+        const ratio = ratioIdx >= 0 && row[ratioIdx] !== null && row[ratioIdx] !== undefined
+          ? Number(Number(row[ratioIdx]).toFixed(2))
+          : (seats > 0 ? Number((applicants / seats).toFixed(2)) : 0);
+
+        typeMap.get(typeName).push({
+          id: `past-${i}-${slug(name)}`,
+          name,
+          seats,
+          applicants,
+          ratio
+        });
+      });
+
+      const admissionTypes = [];
+      let typeIndex = 0;
+      for (const [name, rows] of typeMap.entries()) {
+        admissionTypes.push({
+          id: `past-type-${typeIndex++}`,
+          name,
+          rows,
+          total: totalForRows(rows)
+        });
+      }
+      return { year: String(year || ''), admissionTypes };
+    } catch {}
+  }
+
+  const yearMatch = html.match(/(20\d{2})\s*학년도/);
+  const admissionTypes = [];
+  const tableRe = /<table\b[^>]*>([\s\S]*?)<\/table>/gi;
+  let match;
+  let idx = 0;
+  while ((match = tableRe.exec(html))) {
+    const rows = rowsFromTable(match[1], `past-${idx}`);
+    idx += 1;
+    if (!rows.length) continue;
+    const before = html.slice(Math.max(0, match.index - 500), match.index);
+    const heading = cleanText([...before.matchAll(/<(?:h[1-4]|strong|b|caption)[^>]*>([\s\S]*?)<\/(?:h[1-4]|strong|b|caption)>/gi)]
+      .map((e) => e[1]).filter(Boolean).pop() || '')
+      .replace(/\s*경쟁률\s*현황?/g, '').replace(/경쟁률/g, '').replace(/전체|모집단위별|최종/g, '').trim();
+    admissionTypes.push({ id: `past-${idx - 1}`, name: heading || '경쟁률 현황', rows, total: totalForRows(rows) });
+  }
+  return { year: yearMatch?.[1] || String(year || ''), admissionTypes };
+}
+
+async function readPastCompetition(pastRatioId, year, category) {
+  const cacheKey = `past:${pastRatioId}:${year}:${category}`;
+  const cached = historyCache.get(cacheKey);
+  if (cached && Date.now() - cached.cachedAt < HISTORY_CACHE_TTL_MS) return cached.payload;
+
+  const url = `https://apply.jinhakapply.com/SmartRatio/PastRatioUniv?univid=${encodeURIComponent(pastRatioId)}&year=${encodeURIComponent(year)}&category=${encodeURIComponent(category)}`;
+  const html = await fetchHtml(url, 'utf-8', ALLOWED_HISTORY_HOSTS);
+  const parsed = parsePastRatio(html, year);
+  const payload = {
+    year: parsed.year || String(year),
+    admissionTypes: parsed.admissionTypes,
+    source: 'jinhakapply-past',
+    fetchedAt: new Date().toISOString()
+  };
+  historyCache.set(cacheKey, { cachedAt: Date.now(), payload });
+  return payload;
+}
+
+function parseUwayPastRatio(html, year) {
+  const tableMatch = html.match(/<table\b[^>]*>([\s\S]*?)<\/table>/i);
+  if (!tableMatch) return { year: String(year || ''), admissionTypes: [] };
+
+  const trs = [...tableMatch[1].matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi)];
+  if (trs.length < 2) return { year: String(year || ''), admissionTypes: [] };
+
+  const typeMap = new Map();
+  let rowIndex = 0;
+
+  for (let i = 1; i < trs.length; i++) {
+    const cells = [...trs[i][1].matchAll(/<(?:td|th)\b[^>]*>([\s\S]*?)<\/(?:td|th)>/gi)].map((m) => cleanText(m[1]));
+    if (cells.length < 9) continue;
+
+    const admissionName = cells[4] || '일반전형';
+    const deptName = cells[5] || '';
+    const seats = parseIntegerCell(cells[6]) ?? 0;
+    const applicants = parseIntegerCell(cells[7]) ?? 0;
+    const ratio = parseRatio(cells[8]) ?? (seats > 0 ? Number((applicants / seats).toFixed(2)) : 0);
+
+    if (!typeMap.has(admissionName)) {
+      typeMap.set(admissionName, []);
+    }
+
+    typeMap.get(admissionName).push({
+      id: `uway-past-${rowIndex++}-${slug(deptName)}`,
+      name: deptName,
+      seats,
+      applicants,
+      ratio
+    });
+  }
+
+  const admissionTypes = [];
+  let typeIdx = 0;
+  for (const [name, rows] of typeMap.entries()) {
+    admissionTypes.push({
+      id: `uway-type-${typeIdx++}`,
+      name,
+      rows,
+      total: totalForRows(rows)
+    });
+  }
+
+  return { year: String(year || ''), admissionTypes };
+}
+
+async function readUwayPastCompetition(univName, year) {
+  const cleanName = String(univName || '').replace(/\(.*?\)/g, '').trim();
+  const cacheKey = `uway-past:${cleanName}:${year}`;
+  const cached = historyCache.get(cacheKey);
+  if (cached && Date.now() - cached.cachedAt < HISTORY_CACHE_TTL_MS) return cached.payload;
+
+  const encName = encodeEucKrQuery(cleanName);
+  const url = `https://info.uway.com/power/?v_mode=last_ratio_view&o_year=${encodeURIComponent(year)}&R_SearchText=${encName}`;
+  const html = await fetchHtml(url, 'euc-kr', ALLOWED_SEARCH_HOSTS);
+  const parsed = parseUwayPastRatio(html, year);
+  const payload = {
+    year: parsed.year || String(year),
+    admissionTypes: parsed.admissionTypes,
+    source: 'uwayapply-past',
+    fetchedAt: new Date().toISOString()
+  };
+  historyCache.set(cacheKey, { cachedAt: Date.now(), payload });
+  return payload;
 }
 
 function sendJson(response, status, payload) {
@@ -817,6 +1026,55 @@ async function handleApi(url, response) {
     return true;
   }
 
+  if (url.pathname === '/api/competition/history') {
+    const id = url.searchParams.get('university');
+    const sourceUrl = url.searchParams.get('url') || url.searchParams.get('sourceUrl');
+    const year = url.searchParams.get('year');
+    const category = url.searchParams.get('category') || '1';
+    if (!year || !/^20\d{2}$/.test(year)) {
+      sendJson(response, 400, { error: '올바른 학년도(예: 2025)를 입력하세요.' });
+      return true;
+    }
+    const nameParam = url.searchParams.get('name') || '';
+    const catalogEntry = UNIVERSITY_CATALOG.find((item) => item.id === id || item.name === id || (nameParam && item.name === nameParam));
+    const entry = catalogEntry || entryFromCompetitionUrl(sourceUrl, { id, name: nameParam || undefined, provider: url.searchParams.get('provider') || undefined });
+    if (!entry) {
+      sendJson(response, 400, { error: '대학 정보를 찾을 수 없습니다.', code: 'INVALID_UNIVERSITY' });
+      return true;
+    }
+
+    const isJinhak = entry.provider === '진학어플라이' || entry.parser === 'jinhak' || String(entry.url || '').includes('jinhakapply.com');
+    const isUway = entry.provider === '유웨이' || entry.parser === 'uway' || String(entry.url || '').includes('uwayapply.com') || String(entry.url || '').includes('uway.com');
+
+    try {
+      if (isJinhak) {
+        const pastRatioId = extractPastRatioId(entry);
+        if (!pastRatioId) {
+          sendJson(response, 400, { error: '이 대학은 과거 경쟁률 코드를 찾을 수 없습니다.', code: 'NO_HISTORY' });
+          return true;
+        }
+        const payload = await readPastCompetition(pastRatioId, year, category);
+        sendJson(response, 200, payload);
+        return true;
+      } else if (isUway) {
+        const univName = entry.name;
+        if (!univName || univName === '검색한 대학') {
+          sendJson(response, 400, { error: '대학명을 알 수 없어 과거 경쟁률을 조회할 수 없습니다.', code: 'NO_HISTORY' });
+          return true;
+        }
+        const payload = await readUwayPastCompetition(univName, year);
+        sendJson(response, 200, payload);
+        return true;
+      } else {
+        sendJson(response, 400, { error: '이 대학은 아직 과거 경쟁률 비교를 지원하지 않습니다.', code: 'NO_HISTORY' });
+        return true;
+      }
+    } catch (error) {
+      sendJson(response, 502, { error: error.message || '과거 경쟁률을 불러오지 못했습니다.', code: error.code || 'HISTORY_FAILED' });
+      return true;
+    }
+  }
+
   if (url.pathname !== '/api/competition') return false;
   const id = url.searchParams.get('university');
   const sourceUrl = url.searchParams.get('url') || url.searchParams.get('sourceUrl');
@@ -825,7 +1083,8 @@ async function handleApi(url, response) {
     id,
     name: url.searchParams.get('name') || undefined,
     category: url.searchParams.get('category') || undefined,
-    provider: url.searchParams.get('provider') || undefined
+    provider: url.searchParams.get('provider') || undefined,
+    guideUrl: url.searchParams.get('guideUrl') || undefined
   });
   if (!entry) {
     sendJson(response, 400, { error: '지원하지 않는 경쟁률 상세 URL입니다.' });

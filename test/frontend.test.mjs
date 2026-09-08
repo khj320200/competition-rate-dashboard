@@ -6,7 +6,7 @@ import { readFile } from 'node:fs/promises';
 const script = await readFile(new URL('../app.js', import.meta.url), 'utf8');
 function element() {
   const classes = new Set();
-  return { textContent: '', value: '', children: [], disabled: false,
+  return { textContent: '', value: '', children: [], disabled: false, dataset: {},
     classList: { add: x => classes.add(x), remove: x => classes.delete(x), contains: x => classes.has(x),
       toggle: (x, enabled) => enabled ? classes.add(x) : classes.delete(x) },
     replaceChildren(...children) { this.children = children; },
@@ -65,3 +65,69 @@ test('fresh refresh updates values, clears warning and uses the server collectio
   assert.equal(app.run('state.watchlist[0].refreshedAt'), payload.fetchedAt);
   assert.match(app.elements.get('refreshStatus').textContent, /1개 항목/);
 });
+
+test('history button toggles open state and renders comparison cell', async () => {
+  const app = boot(payload);
+  await app.run("selectUniversity({ name: '가톨릭대학교', url: 'https://addon.jinhakapply.com/test.html' })");
+  app.run("selectDepartment('1', 'r1'); addCurrent();");
+  const watchBody = app.elements.get('watchBody');
+  const row = watchBody.children[0];
+  const uniCell = row.children[0];
+  const toggleIcon = uniCell.children[0];
+  assert.equal(toggleIcon.textContent, '▸');
+
+  // Toggle open
+  app.run("toggleHistory(state.watchlist[0].key);");
+  const updatedRow = watchBody.children[0];
+  assert.equal(updatedRow.children[0].children[0].textContent, '▾');
+
+  // Test formatDelta
+  const up = app.run("formatDelta(5.5, 3.2)");
+  assert.equal(up.text, '▲2.30');
+  assert.equal(up.cls, 'ratio-up');
+
+  const down = app.run("formatDelta(2.1, 4.5)");
+  assert.equal(down.text, '▼2.40');
+  assert.equal(down.cls, 'ratio-down');
+
+  // Test findHistoryMatch
+  const mockData = {
+    admissionTypes: [{
+      name: '학생부종합',
+      rows: [{ name: '컴퓨터공학과', seats: 12, applicants: 48, ratio: 4 }]
+    }]
+  };
+  app.context.mockData = mockData;
+  const match = app.run("findHistoryMatch(mockData, { admission: '학생부종합', department: '컴퓨터공학과' })");
+  assert.equal(match.row.ratio, 4);
+});
+
+test('watchlist renders admission guide button with correct URL and fallback', async () => {
+  const guidePayload = {
+    ...payload,
+    guideUrl: 'https://apply.jinhakapply.com/Notice/1003038/A'
+  };
+  const app = boot(guidePayload);
+  await app.run("selectUniversity({ name: '가톨릭대학교', url: 'https://addon.jinhakapply.com/RatioV1/RatioH/Ratio10030381.html' })");
+  app.run("selectDepartment('1', 'r1'); addCurrent();");
+
+  const watchBody = app.elements.get('watchBody');
+  const row = watchBody.children[0];
+  const uniCell = row.children[0];
+  assert.equal(uniCell.children.length, 3);
+  const guideTag = uniCell.children[2];
+  assert.equal(guideTag.textContent, '요강 ↗');
+  assert.equal(guideTag.target, '_blank');
+  assert.equal(guideTag.href, 'https://apply.jinhakapply.com/Notice/1003038/A');
+
+  // Fallback test with Jinhak sourceUrl
+  const jinhakItem = { university: '가톨릭대학교', sourceUrl: 'https://addon.jinhakapply.com/RatioV1/RatioH/Ratio10030381.html' };
+  app.context.jinhakItem = jinhakItem;
+  assert.equal(app.run('getGuideUrl(jinhakItem)'), 'https://apply.jinhakapply.com/Notice/1003038/A');
+
+  // Fallback test with generic university without guideUrl
+  const fallbackItem = { university: '테스트대학교' };
+  app.context.fallbackItem = fallbackItem;
+  assert.match(app.run('getGuideUrl(fallbackItem)'), /search\.naver\.com.*%ED%85%8C%EC%8A%A4%ED%8A%B8%EB%8C%80%ED%95%99%EA%B5%90/);
+});
+

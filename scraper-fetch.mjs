@@ -1,7 +1,7 @@
 import { fetch, ProxyAgent } from 'undici';
 
 export const SOURCE_HOSTS = new Set([
-  'addon.jinhakapply.com', 'ratio.uwayapply.com', 'info.uway.com'
+  'addon.jinhakapply.com', 'apply.jinhakapply.com', 'ratio.uwayapply.com', 'info.uway.com'
 ]);
 
 export class ScraperError extends Error {

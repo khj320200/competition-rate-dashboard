@@ -2,6 +2,7 @@
 
 const WATCH_KEY = 'ratio-watchlist-v1';
 const numberFormat = new Intl.NumberFormat('ko-KR');
+const HISTORY_YEARS = [2026, 2025, 2024];
 
 const state = {
   catalog: [],
@@ -11,7 +12,9 @@ const state = {
   admissionId: '',
   departmentId: '',
   watchlist: [],
-  loading: false
+  loading: false,
+  historyOpen: new Set(),
+  historyData: new Map()
 };
 
 const $ = (id) => document.getElementById(id);
@@ -242,6 +245,16 @@ function updateAddButton() {
   dom.addButton.textContent = exists ? '이미 추가됨' : '관심 목록에 추가';
 }
 
+function getGuideUrl(item) {
+  if (item.guideUrl) return item.guideUrl;
+  if (item.sourceUrl) {
+    const jinhakMatch = item.sourceUrl.match(/Ratio(\d{7})\d?\.html/i);
+    if (jinhakMatch) return `https://apply.jinhakapply.com/Notice/${jinhakMatch[1]}/A`;
+  }
+  const query = encodeURIComponent(`${item.university} 모집요강`);
+  return `https://search.naver.com/search.naver?query=${query}`;
+}
+
 function addCurrent() {
   const row = currentRow();
   const type = currentType();
@@ -250,6 +263,7 @@ function addCurrent() {
   if (state.watchlist.some((item) => item.key === key)) return;
   const source = state.data.source || {};
   const warning = staleWarning(state.data);
+  const guideUrl = state.data.guideUrl || state.data.source?.guideUrl || state.university?.guideUrl || '';
   state.watchlist.unshift({
     key,
     university: state.data.university || state.university?.name || '',
@@ -265,6 +279,7 @@ function addCurrent() {
     providerUpdatedAt: state.data.updatedAt || '',
     providerUpdateInterval: source.updateInterval || '',
     providerNote: state.data.note || '',
+    guideUrl,
     refreshedAt: state.data.fetchedAt || (warning ? '' : new Date().toISOString()),
     refreshError: warning
   });
@@ -339,6 +354,204 @@ function formatProviderUpdatedAt(value) {
   return date ? formatYearMonthDayHour(date) : '';
 }
 
+
+function findHistoryMatch(data, item) {
+  if (!data?.admissionTypes) return null;
+  const cleanTarget = item.department.replace(/\s/g, '');
+  // 1. Exact match in matching admission type
+  for (const type of data.admissionTypes) {
+    if (item.admission && (type.name.includes(item.admission) || item.admission.includes(type.name))) {
+      for (const row of type.rows || []) {
+        if (row.name === item.department || row.name.replace(/\s/g, '') === cleanTarget) {
+          return { type, row };
+        }
+      }
+    }
+  }
+  // 2. Exact match across all types
+  for (const type of data.admissionTypes) {
+    for (const row of type.rows || []) {
+      if (row.name === item.department || row.name.replace(/\s/g, '') === cleanTarget) {
+        return { type, row };
+      }
+    }
+  }
+  // 3. Substring match
+  for (const type of data.admissionTypes) {
+    for (const row of type.rows || []) {
+      const cleanRow = row.name.replace(/\s/g, '');
+      if (cleanRow && cleanTarget && (cleanRow.includes(cleanTarget) || cleanTarget.includes(cleanRow))) {
+        return { type, row };
+      }
+    }
+  }
+  // 4. Base name match (strip parentheses and 학과/학부/전공 suffixes)
+  const baseTarget = cleanTarget.replace(/\(.*?\)/g, '').replace(/학과|학부|전공/g, '');
+  if (baseTarget.length >= 2) {
+    for (const type of data.admissionTypes) {
+      for (const row of type.rows || []) {
+        const baseRow = row.name.replace(/\s/g, '').replace(/\(.*?\)/g, '').replace(/학과|학부|전공/g, '');
+        if (baseRow && (baseRow === baseTarget || baseRow.includes(baseTarget) || baseTarget.includes(baseRow))) {
+          return { type, row };
+        }
+      }
+    }
+  }
+  return null;
+}
+
+async function fetchHistory(item) {
+  const results = [];
+  for (const year of HISTORY_YEARS) {
+    const cacheKey = `${item.sourceUrl || item.university}:${year}`;
+    if (state.historyData.has(cacheKey)) {
+      results.push({ year, ...state.historyData.get(cacheKey) });
+      continue;
+    }
+    try {
+      const params = new URLSearchParams({
+        url: item.sourceUrl || '',
+        name: item.university || '',
+        provider: item.provider || '',
+        year: String(year),
+        category: '1'
+      });
+      const data = await fetchJson(`/api/competition/history?${params.toString()}`);
+      const match = findHistoryMatch(data, item);
+      const entry = match
+        ? { found: true, seats: match.row.seats, applicants: match.row.applicants, ratio: match.row.ratio, admission: match.type.name, department: match.row.name }
+        : { found: false, error: '해당 모집단위를 찾지 못했습니다.' };
+      state.historyData.set(cacheKey, entry);
+      results.push({ year, ...entry });
+    } catch (error) {
+      const entry = { found: false, error: error.message || '과거 데이터 조회 실패' };
+      if (error.message && /NO_HISTORY|지원하지 않/.test(error.message)) {
+        state.historyData.set(cacheKey, entry);
+      }
+      results.push({ year, ...entry });
+    }
+  }
+  return results;
+}
+
+function formatDelta(current, past) {
+  if (current === null || current === undefined || past === null || past === undefined) return null;
+  const diff = Number(current) - Number(past);
+  if (Number.isNaN(diff)) return null;
+  const abs = Math.abs(diff).toFixed(2);
+  if (diff > 0.005) return { text: `▲${abs}`, cls: 'ratio-up' };
+  if (diff < -0.005) return { text: `▼${abs}`, cls: 'ratio-down' };
+  return { text: '-', cls: 'ratio-same' };
+}
+
+async function toggleHistory(key) {
+  const item = state.watchlist.find((w) => w.key === key);
+  if (!item) return;
+  if (state.historyOpen.has(key)) {
+    state.historyOpen.delete(key);
+    renderWatchlist();
+    return;
+  }
+  state.historyOpen.add(key);
+  renderWatchlist();
+
+  const allCached = HISTORY_YEARS.every((y) => state.historyData.has(`${item.sourceUrl || item.university}:${y}`));
+  if (!allCached) {
+    try {
+      await fetchHistory(item);
+    } catch {}
+    if (state.historyOpen.has(key)) {
+      renderWatchlist();
+    }
+  }
+}
+
+function renderHistoryContent(container, item, results) {
+  const guideBar = document.createElement('div');
+  guideBar.className = 'history-guide-bar';
+  const guideTitle = document.createElement('span');
+  guideTitle.className = 'history-guide-title';
+  guideTitle.textContent = `${item.university} ${item.admission}`;
+  const guideBtn = document.createElement('a');
+  guideBtn.className = 'btn-guide-link';
+  guideBtn.href = getGuideUrl(item);
+  guideBtn.target = '_blank';
+  guideBtn.rel = 'noopener noreferrer';
+  guideBtn.title = `${item.university} 모집요강 바로가기 (새 창)`;
+  guideBtn.textContent = '📄 모집요강 바로가기 ↗';
+  guideBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+  });
+  guideBar.append(guideTitle, guideBtn);
+
+  const sortedResults = [...results].sort((a, b) => a.year - b.year);
+  const hasAny = sortedResults.some((r) => r.found);
+  if (!hasAny) {
+    const isUnsupported = sortedResults.some((r) => r.error && /NO_HISTORY|지원하지 않/.test(r.error));
+    const emptyMsg = document.createElement('div');
+    emptyMsg.className = 'history-empty-msg';
+    emptyMsg.textContent = isUnsupported ? '과거 경쟁률 데이터가 제공되지 않는 대학입니다' : '과거 데이터를 찾지 못했습니다';
+    container.replaceChildren(guideBar, emptyMsg);
+    return;
+  }
+
+  const strip = document.createElement('div');
+  strip.className = 'history-strip';
+
+  // Past years
+  sortedResults.forEach((r) => {
+    const itemEl = document.createElement('div');
+    itemEl.className = 'history-chip';
+
+    const yearEl = document.createElement('div');
+    yearEl.className = 'chip-year';
+    yearEl.textContent = `${r.year}년`;
+
+    const rateEl = document.createElement('div');
+    rateEl.className = 'chip-rate';
+    rateEl.textContent = r.found ? formatRatio(r.ratio) : '-';
+
+    const countEl = document.createElement('div');
+    countEl.className = 'chip-count';
+    countEl.textContent = r.found ? `${formatCount(r.seats)}모집 · ${formatCount(r.applicants)}지원` : '자료 없음';
+
+    itemEl.append(yearEl, rateEl, countEl);
+    strip.append(itemEl);
+  });
+
+  // Current year (highlighted)
+  const currentEl = document.createElement('div');
+  currentEl.className = 'history-chip current';
+
+  const currentYear = document.createElement('div');
+  currentYear.className = 'chip-year';
+  currentYear.textContent = '현재 실시간';
+
+  const currentRate = document.createElement('div');
+  currentRate.className = 'chip-rate current';
+  currentRate.textContent = formatRatio(item.ratio);
+
+  const lastFound = [...sortedResults].reverse().find((r) => r.found && r.ratio !== null);
+  if (lastFound) {
+    const delta = formatDelta(item.ratio, lastFound.ratio);
+    if (delta && delta.text && delta.text !== '-') {
+      const badge = document.createElement('span');
+      badge.className = `delta-badge ${delta.cls === 'ratio-up' ? 'up' : 'down'}`;
+      badge.textContent = delta.text;
+      currentRate.append(badge);
+    }
+  }
+
+  const currentCount = document.createElement('div');
+  currentCount.className = 'chip-count';
+  currentCount.textContent = `${formatCount(item.seats)}모집 · ${formatCount(item.applicants)}지원`;
+
+  currentEl.append(currentYear, currentRate, currentCount);
+  strip.append(currentEl);
+
+  container.replaceChildren(guideBar, strip);
+}
+
 function renderWatchlist() {
   dom.watchBody.replaceChildren();
   dom.watchCount.textContent = String(state.watchlist.length);
@@ -346,22 +559,79 @@ function renderWatchlist() {
   dom.watchEmpty.hidden = state.watchlist.length > 0;
   dom.refreshButton.disabled = Boolean(state.refreshing) || state.watchlist.length === 0;
   dom.clearButton.disabled = Boolean(state.refreshing) || state.watchlist.length === 0;
+
   state.watchlist.forEach((item) => {
+    const isOpen = state.historyOpen.has(item.key);
     const tr = document.createElement('tr');
-    const cells = [item.university, item.admission, item.department].map((text) => {
-      const td = document.createElement('td');
-      td.textContent = text;
-      return td;
+    tr.className = 'watch-row' + (isOpen ? ' open' : '');
+    tr.tabIndex = 0;
+    tr.setAttribute('role', 'button');
+    tr.setAttribute('aria-expanded', String(isOpen));
+    tr.setAttribute('title', '클릭하여 과거 경쟁률 비교 펼치기/접기');
+
+    tr.addEventListener('click', (e) => {
+      if (e.target.closest('.remove') || e.target.closest('.btn-guide-tag')) return;
+      toggleHistory(item.key);
     });
+    tr.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        if (e.target.closest('.remove') || e.target.closest('.btn-guide-tag')) return;
+        e.preventDefault();
+        toggleHistory(item.key);
+      }
+    });
+
+    // 1. University cell with arrow toggle icon and guide link
+    const uniTd = document.createElement('td');
+    uniTd.className = 'uni-cell';
+    const toggleIcon = document.createElement('span');
+    toggleIcon.className = 'toggle-icon' + (isOpen ? ' open' : '');
+    toggleIcon.textContent = isOpen ? '▾' : '▸';
+    toggleIcon.setAttribute('aria-hidden', 'true');
+    const uniText = document.createElement('span');
+    uniText.className = 'uni-name';
+    uniText.textContent = item.university;
+
+    const guideLink = document.createElement('a');
+    guideLink.className = 'btn-guide-tag';
+    guideLink.href = getGuideUrl(item);
+    guideLink.target = '_blank';
+    guideLink.rel = 'noopener noreferrer';
+    guideLink.title = `${item.university} 모집요강 바로가기 (새 창)`;
+    guideLink.setAttribute('aria-label', `${item.university} 모집요강 바로가기`);
+    guideLink.textContent = '요강 ↗';
+    guideLink.addEventListener('click', (e) => {
+      e.stopPropagation();
+    });
+
+    uniTd.append(toggleIcon, uniText, guideLink);
+
+    // 2. Admission cell
+    const admTd = document.createElement('td');
+    admTd.className = 'adm-cell';
+    admTd.textContent = item.admission;
+
+    // 3. Department cell
+    const deptTd = document.createElement('td');
+    deptTd.className = 'dept-cell';
+    deptTd.textContent = item.department;
+
+    // 4. Seats
     const seats = document.createElement('td');
     seats.className = 'num';
     seats.textContent = formatCount(item.seats);
+
+    // 5. Applicants
     const applicants = document.createElement('td');
     applicants.className = 'num';
     applicants.textContent = formatCount(item.applicants);
+
+    // 6. Ratio
     const ratio = document.createElement('td');
-    ratio.className = 'num';
+    ratio.className = 'num ratio-cell';
     ratio.textContent = formatRatio(item.ratio);
+
+    // 7. Provider updated
     const providerUpdated = document.createElement('td');
     providerUpdated.className = 'provider-updated-at';
     providerUpdated.textContent = formatProviderUpdatedAt(item.providerUpdatedAt);
@@ -369,16 +639,43 @@ function renderWatchlist() {
       providerUpdated.classList.add('refresh-error');
       providerUpdated.textContent = `${providerUpdated.textContent || '-'} · 갱신 실패: ${item.refreshError}`;
     }
+
+    // 8. Remove button
     const remove = document.createElement('td');
     remove.className = 'remove';
     const button = document.createElement('button');
     button.type = 'button';
     button.textContent = '삭제';
+    button.title = '관심 목록에서 삭제';
     button.disabled = Boolean(state.refreshing);
-    button.addEventListener('click', () => removeWatch(item.key));
+    button.addEventListener('click', (e) => {
+      e.stopPropagation();
+      removeWatch(item.key);
+    });
     remove.append(button);
-    tr.append(...cells, seats, applicants, ratio, providerUpdated, remove);
+
+    tr.append(uniTd, admTd, deptTd, seats, applicants, ratio, providerUpdated, remove);
     dom.watchBody.append(tr);
+
+    if (isOpen) {
+      const expandTr = document.createElement('tr');
+      expandTr.className = 'history-expand open';
+      expandTr.dataset.historyKey = item.key;
+      const expandTd = document.createElement('td');
+      expandTd.colSpan = 8;
+      const inner = document.createElement('div');
+      inner.className = 'history-inner';
+      const allCached = HISTORY_YEARS.every((y) => state.historyData.has(`${item.sourceUrl || item.university}:${y}`));
+      if (allCached) {
+        const results = HISTORY_YEARS.map((year) => ({ year, ...state.historyData.get(`${item.sourceUrl || item.university}:${year}`) }));
+        renderHistoryContent(inner, item, results);
+      } else {
+        inner.innerHTML = '<div class="history-loading"><span class="loading-spinner"></span> 과거 경쟁률을 불러오는 중...</div>';
+      }
+      expandTd.append(inner);
+      expandTr.append(expandTd);
+      dom.watchBody.append(expandTr);
+    }
   });
 }
 
@@ -466,6 +763,7 @@ async function refreshWatchlist() {
         providerUpdatedAt: result.data.updatedAt || item.providerUpdatedAt || '',
         providerUpdateInterval: source.updateInterval || item.providerUpdateInterval || '',
         providerNote: result.data.note || item.providerNote || '',
+        guideUrl: result.data.guideUrl || result.data.source?.guideUrl || item.guideUrl || '',
         refreshedAt: result.data.fetchedAt || new Date().toISOString(),
         refreshError: ''
       };
